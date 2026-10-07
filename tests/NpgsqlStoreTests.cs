@@ -10,6 +10,7 @@ namespace Ticket.Adapter.Npgsql.Tests;
 // (connection string). Without it they pass as no-ops — run them with:
 //   docker run -d --rm -e POSTGRES_PASSWORD=test -p 5433:5432 postgres:17-alpine
 //   TEST_POSTGRES="Host=localhost;Port=5433;Username=postgres;Password=test;Database=postgres" dotnet test
+[Collection("postgres")]
 public class NpgsqlStoreTests
 {
     private static string? Pg => Environment.GetEnvironmentVariable("TEST_POSTGRES");
@@ -95,7 +96,8 @@ public class NpgsqlStoreTests
         // The import only runs against an empty ticket table; make this test's
         // view of the shared test database empty (FK order matters).
         Scalar("""
-            truncate interaction_option, interaction, ticket_report, ticket_note,
+            truncate it_staff_absence, it_staff_skill, it_staff, ticket_category,
+                    interaction_option, interaction, ticket_report, ticket_note,
                     ticket_status_event, ticket, discord_user, solution restart identity
             """);
 

@@ -27,12 +27,14 @@ namespace Ticket.Adapter.Npgsql;
 public sealed partial class NpgsqlTicketStore : ITicketStore
 {
     private readonly NpgsqlDataSource _db;
+    private readonly NpgsqlDirectory _directory;
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
     public NpgsqlTicketStore(string connectionString)
     {
         _db = NpgsqlDataSource.Create(connectionString);
         EnsureSchema();
+        _directory = new NpgsqlDirectory(_db);
     }
 
     [GeneratedRegex(@"^<?@?(\d+)>?$")]
@@ -120,6 +122,11 @@ public sealed partial class NpgsqlTicketStore : ITicketStore
             """);
         cmd.ExecuteNonQuery();
     }
+
+    public IReadOnlyList<TicketCategory> Categories() => _directory.Categories();
+
+    public TicketRoute Route(string? categorySlug, DateTimeOffset nowUtc) =>
+        _directory.Route(categorySlug, nowUtc);
 
     public void Append(string user, string id, string priority, bool auto, bool offline,
         string? title, string? desc, string? file, string? assigned)
