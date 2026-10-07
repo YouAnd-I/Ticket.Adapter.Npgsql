@@ -18,7 +18,7 @@ public class NpgsqlDirectoryTests
     private static NpgsqlDirectory Directory(NpgsqlDataSource db)
     {
         using var cmd = db.CreateCommand("""
-            drop table if exists it_staff_absence, it_staff_skill, it_staff, ticket_category cascade
+            drop table if exists it_staff_skill, ticket_category, it_staff_absence, it_staff cascade
             """);
         cmd.ExecuteNonQuery();
         return new NpgsqlDirectory(db);
@@ -34,29 +34,17 @@ public class NpgsqlDirectoryTests
     public class SheetReplaceAndRoute
     {
         [Fact]
-        public void RoundTrips_AllFourTabs_FromSheetRows()
+        public void RoundTrips_StaffAndAbsences_FromSheetRows()
         {
             if (Pg is null) return;
             using var db = Connect();
             var directory = Directory(db);
 
-            directory.ReplaceFromSheet("ticket_category",
-            [
-                ["Category Slug", "Description", "Priority Code"],
-                ["network", "wifi and VPN", ""],
-                ["hardware", "printers", "urgent"],
-            ]);
             directory.ReplaceFromSheet("it_staff",
             [
-                ["User Id", "Display Name", "Active"],
-                ["100", "Alice", "TRUE"],
-                ["200", "Bob", "TRUE"],
-            ]);
-            directory.ReplaceFromSheet("it_staff_skill",
-            [
-                ["User Id", "Category Slug"],
-                ["100", "network"],
-                ["200", "hardware"],
+                ["User Id", "Display Name", "Handles", "Active"],
+                ["100", "Alice", "wifi, VPN, DNS", "TRUE"],
+                ["200", "Bob", "printers, laptops", "TRUE"],
             ]);
             directory.ReplaceFromSheet("it_staff_absence",
             [
@@ -64,27 +52,75 @@ public class NpgsqlDirectoryTests
                 ["200", "2026-10-07", "2026-10-07", "out for Oct 7"],
             ]);
 
+            var available = directory.AvailableStaff(new DateTimeOffset(2026, 10, 6, 12, 0, 0, TimeSpan.Zero));
             Assert.Equal(
             [
-                new TicketCategory("hardware", "printers"),
-                new TicketCategory("network", "wifi and VPN"),
-            ], directory.Categories());
+                new StaffMember("100", "Alice", "wifi, VPN, DNS"),
+                new StaffMember("200", "Bob", "printers, laptops"),
+            ], available);
 
-            var routed = directory.Route("network", new DateTimeOffset(2026, 10, 6, 12, 0, 0, TimeSpan.Zero));
-            Assert.Equal([100UL], routed.StaffIds);
-
-            var withoutBob = directory.Route("hardware", new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero));
+            var withoutBob = directory.Route(new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero));
             Assert.Equal([100UL], withoutBob.StaffIds);
 
-            var networkNextDay = directory.Route("network", new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
-            Assert.Equal([100UL], networkNextDay.StaffIds);
-
-            var both = directory.Route("account-access", new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
-            Assert.Equal([100UL, 200UL], both.StaffIds);
+            var back = directory.Route(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
+            Assert.Equal([100UL, 200UL], back.StaffIds);
         }
 
         [Fact]
-        public void Route_FallsBackToAvailableGeneralists_WhenNoSpecialistMatches()
+        public void RoundTrips_PriorityGuidance_FromSheetRows()
+        {
+            if (Pg is null) return;
+            using var db = Connect();
+            var directory = Directory(db);
+
+            directory.ReplaceFromSheet("priority",
+            [
+                ["Priority Code", "Description"],
+                ["urgent", "ping me immediately"],
+                ["no-rush", ""],
+            ]);
+
+            var priorities = directory.Priorities();
+            Assert.Contains(new PriorityOption("urgent", "ping me immediately"), priorities);
+            Assert.Contains(new PriorityOption("no-rush", ""), priorities);
+        }
+
+        [Fact]
+        public void ReplacePriorities_KeepsCodesThatTicketsStillReference()
+        {
+            if (Pg is null) return;
+            using var db = Connect();
+            var directory = Directory(db);
+
+            Exec(db, """
+                insert into priority (priority_code) values ('report'), ('zz-sacrifice')
+                on conflict do nothing
+                """);
+            Exec(db, """
+                insert into discord_user (user_id, username, first_seen_at_utc, last_seen_at_utc)
+                values (900, 'req', now(), now()) on conflict do nothing
+                """);
+            Exec(db, """
+                insert into ticket (ticket_id, requester_user_id, priority_code, created_at_utc)
+                values ('keepme', 900, 'report', now()) on conflict do nothing
+                """);
+
+            directory.ReplaceFromSheet("priority",
+            [
+                ["Priority Code", "Description"],
+                ["urgent", "broken right now"],
+            ]);
+
+            var priorities = directory.Priorities();
+            var codes = priorities.Select(option => option.Code).ToArray();
+            Assert.Contains("urgent", codes);
+            Assert.Contains(new PriorityOption("urgent", "broken right now"), priorities);
+            Assert.Contains("report", codes);
+            Assert.DoesNotContain("zz-sacrifice", codes);
+        }
+
+        [Fact]
+        public void Route_SkipsInactiveStaff_AndCapsAtThree()
         {
             if (Pg is null) return;
             using var db = Connect();
@@ -92,40 +128,17 @@ public class NpgsqlDirectoryTests
 
             directory.ReplaceFromSheet("it_staff",
             [
-                ["User Id", "Display Name", "Active"],
-                ["100", "Alice", "TRUE"],
-                ["200", "Bob", "TRUE"],
-                ["300", "Carol", "FALSE"],
-            ]);
-            directory.ReplaceFromSheet("it_staff_skill",
-            [
-                ["User Id", "Category Slug"],
-                ["100", "network"],
+                ["User Id", "Display Name", "Handles", "Active"],
+                ["1", "A", "", "TRUE"],
+                ["2", "B", "", "TRUE"],
+                ["3", "C", "", "TRUE"],
+                ["4", "D", "", "TRUE"],
+                ["5", "E", "", "TRUE"],
             ]);
 
-            var routed = directory.Route("hardware", new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero));
-            Assert.Equal([100UL, 200UL], routed.StaffIds);
-            Assert.DoesNotContain(300UL, routed.StaffIds);
-        }
-
-        [Fact]
-        public void Route_CapsAtThree()
-        {
-            if (Pg is null) return;
-            using var db = Connect();
-            var directory = Directory(db);
-
-            directory.ReplaceFromSheet("it_staff",
-            [
-                ["User Id", "Display Name", "Active"],
-                ["1", "A", "TRUE"],
-                ["2", "B", "TRUE"],
-                ["3", "C", "TRUE"],
-                ["4", "D", "TRUE"],
-                ["5", "E", "TRUE"],
-            ]);
-
-            Assert.Equal(NpgsqlDirectory.RouteCap, directory.Route(null, DateTimeOffset.UtcNow).StaffIds.Count);
+            var routed = directory.Route(DateTimeOffset.UtcNow);
+            Assert.Equal(NpgsqlDirectory.RouteCap, routed.StaffIds.Count);
+            Assert.Equal([1UL, 2UL, 3UL], routed.StaffIds);
         }
 
         [Fact]
@@ -137,16 +150,10 @@ public class NpgsqlDirectoryTests
 
             directory.ReplaceFromSheet("it_staff",
             [
-                ["User Id", "Display Name", "Active"],
-                ["not-a-number", "Ghost", "TRUE"],
-                ["100", "Alice", ""],
-                ["", "NoBody", "TRUE"],
-            ]);
-            directory.ReplaceFromSheet("it_staff_skill",
-            [
-                ["User Id", "Category Slug"],
-                ["100", "does-not-exist"],
-                ["100", "network"],
+                ["User Id", "Display Name", "Handles", "Active"],
+                ["not-a-number", "Ghost", "", "TRUE"],
+                ["100", "Alice", "wifi and VPN", ""],
+                ["", "NoBody", "", "TRUE"],
             ]);
             directory.ReplaceFromSheet("it_staff_absence",
             [
@@ -155,9 +162,11 @@ public class NpgsqlDirectoryTests
                 ["100", "2026-10-07", "2026-10-07", "ok"],
             ]);
 
-            var routed = directory.Route("network", new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
-            Assert.Equal([100UL], routed.StaffIds);
-            Assert.Empty(directory.Route("network", new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero)).StaffIds);
+            var available = directory.AvailableStaff(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
+            var alice = Assert.Single(available);
+            Assert.Equal("Alice", alice.Name);
+            Assert.Equal("wifi and VPN", alice.Handles);
+            Assert.Empty(directory.Route(new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero)).StaffIds);
         }
 
         [Fact]
@@ -169,8 +178,8 @@ public class NpgsqlDirectoryTests
 
             directory.ReplaceFromSheet("it_staff",
             [
-                ["User Id", "Display Name", "Active"],
-                ["100", "Alice", "TRUE"],
+                ["Active", "Handles", "Display Name", "User Id"],
+                ["TRUE", "wifi", "Alice", "100"],
             ]);
             directory.ReplaceFromSheet("it_staff_absence",
             [
@@ -178,9 +187,9 @@ public class NpgsqlDirectoryTests
                 ["1", "100", "out for Oct 7", "2026-10-07", "2026-10-07"],
             ]);
 
-            Assert.Empty(directory.Route(null, new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero)).StaffIds);
+            Assert.Empty(directory.Route(new DateTimeOffset(2026, 10, 7, 12, 0, 0, TimeSpan.Zero)).StaffIds);
             Assert.Equal([100UL],
-                directory.Route(null, new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero)).StaffIds);
+                directory.Route(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero)).StaffIds);
         }
 
         [Fact]
@@ -193,9 +202,11 @@ public class NpgsqlDirectoryTests
             directory.SeedStaffIfEmpty(999, "on-call");
             directory.SeedStaffIfEmpty(888, "other");
 
-            var seeded = directory.Route(null, DateTimeOffset.UtcNow);
+            var seeded = directory.Route(DateTimeOffset.UtcNow);
             Assert.Contains(999UL, seeded.StaffIds);
             Assert.DoesNotContain(888UL, seeded.StaffIds);
+            Assert.Contains(directory.AvailableStaff(DateTimeOffset.UtcNow),
+                staff => staff.StaffId == "999" && staff.Handles.Length > 0);
         }
     }
 }

@@ -9,7 +9,7 @@ public sealed class NpgsqlDirectory
     public const int RouteCap = 3;
 
     public static readonly IReadOnlyList<string> EditableTabs =
-        ["ticket_category", "it_staff", "it_staff_skill", "it_staff_absence"];
+        ["it_staff", "it_staff_absence", "priority"];
 
     private readonly NpgsqlDataSource _db;
 
@@ -27,23 +27,16 @@ public sealed class NpgsqlDirectory
     private void EnsureSchema()
     {
         using var cmd = _db.CreateCommand("""
-            create table if not exists ticket_category (
-                category_slug  text primary key,
-                description    text not null default '',
-                priority_code  text
-            );
+            drop table if exists it_staff_skill;
+            drop table if exists ticket_category;
 
             create table if not exists it_staff (
                 user_id       bigint primary key references discord_user(user_id),
                 display_name  text not null default '',
+                handles       text not null default '',
                 active        boolean not null default true
             );
-
-            create table if not exists it_staff_skill (
-                user_id       bigint not null references it_staff(user_id) on delete cascade,
-                category_slug text not null references ticket_category(category_slug) on delete cascade,
-                primary key (user_id, category_slug)
-            );
+            alter table it_staff add column if not exists handles text not null default '';
 
             create table if not exists it_staff_absence (
                 absence_id  bigint generated always as identity primary key,
@@ -52,13 +45,6 @@ public sealed class NpgsqlDirectory
                 until_utc   timestamptz not null,
                 note        text not null default ''
             );
-
-            insert into ticket_category (category_slug, description) values
-                ('network', 'wifi, VPN, DNS, internet connectivity outages'),
-                ('hardware', 'printers, laptops, peripherals, physical machines'),
-                ('account-access', 'logins, passwords, permissions, lockouts'),
-                ('software', 'apps, licenses, updates, configuration')
-            on conflict do nothing;
             """);
         cmd.ExecuteNonQuery();
     }
@@ -73,8 +59,8 @@ public sealed class NpgsqlDirectory
             values (@id, @name, now(), now())
             on conflict (user_id) do update set username = excluded.username;
 
-            insert into it_staff (user_id, display_name, active)
-            values (@id, @name, true)
+            insert into it_staff (user_id, display_name, handles, active)
+            values (@id, @name, 'everything IT — first responder', true)
             on conflict (user_id) do nothing;
             """);
         cmd.Parameters.AddWithValue("id", (long)userId);
@@ -82,45 +68,52 @@ public sealed class NpgsqlDirectory
         cmd.ExecuteNonQuery();
     }
 
-    public IReadOnlyList<TicketCategory> Categories()
+    public IReadOnlyList<PriorityOption> Priorities()
     {
-        var categories = new List<TicketCategory>();
+        var options = new List<PriorityOption>();
         using var cmd = _db.CreateCommand(
-            "select category_slug, description from ticket_category order by category_slug");
+            "select priority_code, description from priority order by priority_code");
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
-            categories.Add(new(reader.GetString(0), reader.GetString(1)));
-        return categories;
+            options.Add(new(reader.GetString(0), reader.GetString(1)));
+        return options;
     }
 
-    public TicketRoute Route(string? categorySlug, DateTimeOffset nowUtc)
+    public IReadOnlyList<StaffMember> AvailableStaff(DateTimeOffset nowUtc)
+    {
+        var staff = new List<StaffMember>();
+        using var cmd = CandidatesCommand(nowUtc, null);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            staff.Add(new(reader.GetInt64(0).ToString(CultureInfo.InvariantCulture),
+                reader.GetString(1), reader.GetString(2)));
+        return staff;
+    }
+
+    public TicketRoute Route(DateTimeOffset nowUtc)
     {
         var staff = new List<ulong>();
-        using var cmd = _db.CreateCommand("""
-            with candidate as (
-                select s.user_id,
-                       exists (select 1 from it_staff_skill k
-                               where k.user_id = s.user_id and k.category_slug = @slug) as specialist
-                from it_staff s
-                where s.active
-                  and not exists (select 1 from it_staff_absence a
-                                  where a.user_id = s.user_id
-                                    and @now between a.from_utc and a.until_utc)
-            )
-            select user_id from candidate
-            where @slug is null
-               or specialist
-               or not exists (select 1 from candidate c2 where c2.specialist)
-            order by specialist desc, user_id
-            limit @cap
-            """);
-        cmd.Parameters.AddWithValue("slug", (object?)categorySlug ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("now", nowUtc);
-        cmd.Parameters.AddWithValue("cap", RouteCap);
+        using var cmd = CandidatesCommand(nowUtc, RouteCap);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             staff.Add((ulong)reader.GetInt64(0));
         return new TicketRoute(staff);
+    }
+
+    private NpgsqlCommand CandidatesCommand(DateTimeOffset nowUtc, int? cap)
+    {
+        var cmd = _db.CreateCommand($"""
+            select s.user_id, s.display_name, s.handles
+            from it_staff s
+            where s.active
+              and not exists (select 1 from it_staff_absence a
+                              where a.user_id = s.user_id
+                                and @now between a.from_utc and a.until_utc)
+            order by s.user_id
+            {(cap is { } limit ? "limit " + limit : "")}
+            """);
+        cmd.Parameters.AddWithValue("now", nowUtc);
+        return cmd;
     }
 
     public void ReplaceFromSheet(string tab, IReadOnlyList<IReadOnlyList<string?>> rows)
@@ -134,10 +127,9 @@ public sealed class NpgsqlDirectory
         using var tx = connection.BeginTransaction();
         var data = rows.Skip(1).ToList();
 
-        if (tab == "ticket_category") ReplaceCategories(connection, tx, data, columns);
         if (tab == "it_staff") ReplaceStaff(connection, tx, data, columns);
-        if (tab == "it_staff_skill") ReplaceSkills(connection, tx, data, columns);
         if (tab == "it_staff_absence") ReplaceAbsences(connection, tx, data, columns);
+        if (tab == "priority") ReplacePriorities(connection, tx, data, columns);
 
         tx.Commit();
     }
@@ -162,28 +154,6 @@ public sealed class NpgsqlDirectory
             ? Blank(row[index])
             : null;
 
-    private static void ReplaceCategories(NpgsqlConnection connection, NpgsqlTransaction tx,
-        List<IReadOnlyList<string?>> rows, Dictionary<string, int> columns)
-    {
-        Exec(connection, tx, "delete from ticket_category");
-        var seen = new HashSet<string>();
-        foreach (var row in rows)
-        {
-            var slug = Cell(row, columns, "category_slug");
-            if (slug is null || !seen.Add(slug)) continue;
-            Exec(connection, tx, """
-                insert into ticket_category (category_slug, description, priority_code)
-                values (@slug, @desc, @priority)
-                """, cmd =>
-            {
-                cmd.Parameters.AddWithValue("slug", slug);
-                cmd.Parameters.AddWithValue("desc", Cell(row, columns, "description") ?? "");
-                cmd.Parameters.AddWithValue("priority",
-                    (object?)Cell(row, columns, "priority_code") ?? DBNull.Value);
-            });
-        }
-    }
-
     private static void ReplaceStaff(NpgsqlConnection connection, NpgsqlTransaction tx,
         List<IReadOnlyList<string?>> rows, Dictionary<string, int> columns)
     {
@@ -193,6 +163,7 @@ public sealed class NpgsqlDirectory
         {
             if (!ulong.TryParse(Cell(row, columns, "user_id"), out var userId) || !seen.Add(userId)) continue;
             var name = Cell(row, columns, "display_name") ?? "";
+            var handles = Cell(row, columns, "handles") ?? "";
             var active = Cell(row, columns, "active") is not { Length: > 0 } inactive
                 || inactive.Trim().ToUpperInvariant() != "FALSE";
             Exec(connection, tx, """
@@ -205,37 +176,14 @@ public sealed class NpgsqlDirectory
                 cmd.Parameters.AddWithValue("name", name);
             });
             Exec(connection, tx, """
-                insert into it_staff (user_id, display_name, active)
-                values (@id, @name, @active)
+                insert into it_staff (user_id, display_name, handles, active)
+                values (@id, @name, @handles, @active)
                 """, cmd =>
             {
                 cmd.Parameters.AddWithValue("id", (long)userId);
                 cmd.Parameters.AddWithValue("name", name);
+                cmd.Parameters.AddWithValue("handles", handles);
                 cmd.Parameters.AddWithValue("active", active);
-            });
-        }
-    }
-
-    private static void ReplaceSkills(NpgsqlConnection connection, NpgsqlTransaction tx,
-        List<IReadOnlyList<string?>> rows, Dictionary<string, int> columns)
-    {
-        Exec(connection, tx, "delete from it_staff_skill");
-        var staff = Known(connection, tx, "select user_id from it_staff", reader => reader.GetInt64(0));
-        var categories = Known(connection, tx, "select category_slug from ticket_category", reader => reader.GetString(0));
-        var seen = new HashSet<(long, string)>();
-        foreach (var row in rows)
-        {
-            if (!long.TryParse(Cell(row, columns, "user_id"), out var userId)) continue;
-            var slug = Cell(row, columns, "category_slug");
-            if (slug is null || !staff.Contains(userId) || !categories.Contains(slug)
-                || !seen.Add((userId, slug))) continue;
-            Exec(connection, tx, """
-                insert into it_staff_skill (user_id, category_slug)
-                values (@id, @slug)
-                """, cmd =>
-            {
-                cmd.Parameters.AddWithValue("id", userId);
-                cmd.Parameters.AddWithValue("slug", slug);
             });
         }
     }
@@ -245,11 +193,13 @@ public sealed class NpgsqlDirectory
     {
         Exec(connection, tx, "delete from it_staff_absence");
         var staff = Known(connection, tx, "select user_id from it_staff", reader => reader.GetInt64(0));
+        var seen = new HashSet<(long, DateTimeOffset, DateTimeOffset)>();
         foreach (var row in rows)
         {
             if (!long.TryParse(Cell(row, columns, "user_id"), out var userId) || !staff.Contains(userId)) continue;
             if (!TryWindow(Cell(row, columns, "from_utc"), Cell(row, columns, "until_utc"),
                     out var from, out var until)) continue;
+            if (!seen.Add((userId, from, until))) continue;
             Exec(connection, tx, """
                 insert into it_staff_absence (user_id, from_utc, until_utc, note)
                 values (@id, @from, @until, @note)
@@ -261,6 +211,35 @@ public sealed class NpgsqlDirectory
                 cmd.Parameters.AddWithValue("note", Cell(row, columns, "note") ?? "");
             });
         }
+    }
+
+    // Upserts the sheet's rows and drops the codes the sheet no longer lists —
+    // except codes existing tickets still reference, so the FK never breaks.
+    private static void ReplacePriorities(NpgsqlConnection connection, NpgsqlTransaction tx,
+        List<IReadOnlyList<string?>> rows, Dictionary<string, int> columns)
+    {
+        var codes = new List<string>();
+        var seen = new HashSet<string>();
+        foreach (var row in rows)
+        {
+            var code = Cell(row, columns, "priority_code");
+            if (code is null || !seen.Add(code)) continue;
+            codes.Add(code);
+            Exec(connection, tx, """
+                insert into priority (priority_code, description)
+                values (@code, @desc)
+                on conflict (priority_code) do update set description = excluded.description
+                """, cmd =>
+            {
+                cmd.Parameters.AddWithValue("code", code);
+                cmd.Parameters.AddWithValue("desc", Cell(row, columns, "description") ?? "");
+            });
+        }
+        Exec(connection, tx, """
+            delete from priority
+            where not (priority_code = any(@codes))
+              and not exists (select 1 from ticket t where t.priority_code = priority.priority_code)
+            """, cmd => cmd.Parameters.AddWithValue("codes", codes.ToArray()));
     }
 
     private static HashSet<T> Known<T>(NpgsqlConnection connection, NpgsqlTransaction tx,

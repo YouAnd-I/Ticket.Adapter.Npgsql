@@ -96,7 +96,7 @@ public class NpgsqlStoreTests
         // The import only runs against an empty ticket table; make this test's
         // view of the shared test database empty (FK order matters).
         Scalar("""
-            truncate it_staff_absence, it_staff_skill, it_staff, ticket_category,
+            truncate it_staff_absence, it_staff,
                     interaction_option, interaction, ticket_report, ticket_note,
                     ticket_status_event, ticket, discord_user, solution restart identity
             """);

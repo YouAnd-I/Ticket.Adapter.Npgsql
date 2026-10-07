@@ -9,7 +9,7 @@ namespace Ticket.Adapter.Npgsql;
 // The ticket feature's state in Postgres (Neon), fully normalized:
 //
 //   discord_user(user_id PK, username, first_seen_at_utc, last_seen_at_utc)
-//   priority(priority_code PK)            -- lookup: urgent | no-rush | report
+//   priority(priority_code PK, description)  -- lookup + classifier guidance, sheet-edited
 //   ticket_status(status_code PK)         -- lookup: open | planned | complete | ...
 //   ticket(ticket_id PK, requester → discord_user, assignee → discord_user,
 //          priority → priority, title, description, attachment_url,
@@ -114,19 +114,34 @@ public sealed partial class NpgsqlTicketStore : ITicketStore
                 image_url   text
             );
 
-            insert into priority (priority_code) values ('urgent'), ('no-rush'), ('report')
-                on conflict do nothing;
             insert into ticket_status (status_code)
                 values ('open'), ('planned'), ('complete'), ('reopened'), ('unsolved')
                 on conflict do nothing;
             """);
         cmd.ExecuteNonQuery();
+
+        using (var seed = _db.CreateCommand("""
+            insert into priority (priority_code, description)
+            select @code, @desc
+            where not exists (select 1 from priority)
+            """))
+        {
+            foreach (var option in PriorityGuidance.Defaults)
+            {
+                seed.Parameters.Clear();
+                seed.Parameters.AddWithValue("code", option.Code);
+                seed.Parameters.AddWithValue("desc", option.Description);
+                seed.ExecuteNonQuery();
+            }
+        }
     }
 
-    public IReadOnlyList<TicketCategory> Categories() => _directory.Categories();
+    public IReadOnlyList<PriorityOption> Priorities() => _directory.Priorities();
 
-    public TicketRoute Route(string? categorySlug, DateTimeOffset nowUtc) =>
-        _directory.Route(categorySlug, nowUtc);
+    public IReadOnlyList<StaffMember> AvailableStaff(DateTimeOffset nowUtc) =>
+        _directory.AvailableStaff(nowUtc);
+
+    public TicketRoute Route(DateTimeOffset nowUtc) => _directory.Route(nowUtc);
 
     public void Append(string user, string id, string priority, bool auto, bool offline,
         string? title, string? desc, string? file, string? assigned)
